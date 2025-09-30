@@ -248,7 +248,7 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+              verbose=False, max_text_tokens_per_sentence=120, diffusion_steps=25, **generation_kwargs):
         print(">> start inference...")
         start_time = time.perf_counter()
 
@@ -445,7 +445,6 @@ class IndexTTS2:
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
-                    diffusion_steps = 25
                     inference_cfg_rate = 0.7
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))

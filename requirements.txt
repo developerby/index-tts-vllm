@@ -1,3 +1,7 @@
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+websockets==15.0.1
+python-multipart==0.0.20
 vllm==0.10.2
 descript-audiotools==0.7.2
 matplotlib==3.8.2
@@ -8,6 +12,11 @@ gradio
 ninja
 modelscope
 munch==4.0.0
+torch
+torchaudio
+transformers
+safetensors
+huggingface-hub
 
 WeTextProcessing; platform_machine != "Darwin"
 wetext; platform_system == "Darwin"
