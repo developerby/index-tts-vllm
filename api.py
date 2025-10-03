@@ -20,7 +20,6 @@ class TTSConfig:
     CHUNK_DURATION: float = 0.3
     SLEEP_DURATION: float = 0.28
     GPU_MEMORY_UTILIZATION: float = 0.25
-    BATCH_SIZE: int = 4
 
 
 @dataclass
@@ -128,84 +127,63 @@ class TTSStreamer:
         
         try:
             while not self.queue_status.generation_queue.empty():
-                batch = []
-                batch_size = min(
-                    TTSConfig.BATCH_SIZE, 
-                    self.queue_status.generation_queue.qsize()
-                )
+                request = await self.queue_status.generation_queue.get()
                 
-                for _ in range(batch_size):
-                    if not self.queue_status.generation_queue.empty():
-                        request = await self.queue_status.generation_queue.get()
-                        batch.append(request)
-                
-                if not batch:
-                    break
-                
-                print(f"Processing batch of {len(batch)} requests")
-                
-                tasks = [self._generate_audio(req) for req in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for req, result in zip(batch, results):
-                    if isinstance(result, Exception):
-                        print(f"Generation error for {req.sentence_id}: {result}")
-                        try:
-                            await req.websocket.send_json({
-                                "type": "error",
-                                "request_id": req.request_id,
-                                "sentence_id": req.sentence_id,
-                                "error": str(result)
-                            })
-                        except:
-                            pass
+                try:
+                    await request.websocket.send_json({
+                        "type": "generation.started",
+                        "request_id": request.request_id,
+                        "sentence_id": request.sentence_id
+                    })
                     
-                    self.queue_status.generation_queue.task_done()
+                    output_path = f"/tmp/tts_output_{request.sentence_id.replace('_', '-').replace('.', '-')}.wav"
+                    
+                    print(f"Generating audio to: {output_path}")
+                    
+                    await self.tts.infer(
+                        spk_audio_prompt=TTSConfig.VOICE_PATH,
+                        text=request.text,
+                        output_path=output_path,
+                        emo_vector=request.emo_vector if request.emo_vector is not None else TTSConfig.DEFAULT_EMO_VECTOR,
+                        emo_alpha=request.emo_alpha if request.emo_alpha is not None else TTSConfig.DEFAULT_EMO_ALPHA,
+                        diffusion_steps=request.diffusion_steps if request.diffusion_steps is not None else TTSConfig.DEFAULT_DIFFUSION_STEPS,
+                        verbose=True
+                    )
+                    
+                    print(f"File exists after generation: {os.path.exists(output_path)}")
+                    
+                    if os.path.exists(output_path):
+                        request.output_path = output_path
+                        await self.queue_status.streaming_queue.put(request)
+                        
+                        await request.websocket.send_json({
+                            "type": "generation.completed",
+                            "request_id": request.request_id,
+                            "sentence_id": request.sentence_id
+                        })
+                    else:
+                        await request.websocket.send_json({
+                            "type": "error",
+                            "request_id": request.request_id,
+                            "sentence_id": request.sentence_id,
+                            "error": "Generation failed"
+                        })
+                        
+                except Exception as e:
+                    print(f"Generation error for {request.sentence_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await request.websocket.send_json({
+                        "type": "error",
+                        "request_id": request.request_id,
+                        "sentence_id": request.sentence_id,
+                        "error": str(e)
+                    })
+                
+                self.queue_status.generation_queue.task_done()
                 
         finally:
             self.queue_status.is_processing = False
-    
-    async def _generate_audio(self, request: TTSRequest):
-        try:
-            await request.websocket.send_json({
-                "type": "generation.started",
-                "request_id": request.request_id,
-                "sentence_id": request.sentence_id
-            })
-            
-            output_path = f"/tmp/tts_output_{request.sentence_id.replace('_', '-').replace('.', '-')}.wav"
-            
-            print(f"Generating audio to: {output_path}")
-            
-            await self.tts.infer(
-                spk_audio_prompt=TTSConfig.VOICE_PATH,
-                text=request.text,
-                output_path=output_path,
-                emo_vector=request.emo_vector if request.emo_vector is not None else TTSConfig.DEFAULT_EMO_VECTOR,
-                emo_alpha=request.emo_alpha if request.emo_alpha is not None else TTSConfig.DEFAULT_EMO_ALPHA,
-                diffusion_steps=request.diffusion_steps if request.diffusion_steps is not None else TTSConfig.DEFAULT_DIFFUSION_STEPS,
-                verbose=True
-            )
-            
-            print(f"File exists after generation: {os.path.exists(output_path)}")
-            
-            if os.path.exists(output_path):
-                request.output_path = output_path
-                await self.queue_status.streaming_queue.put(request)
-                
-                await request.websocket.send_json({
-                    "type": "generation.completed",
-                    "request_id": request.request_id,
-                    "sentence_id": request.sentence_id
-                })
-            else:
-                raise Exception("Generation failed: output file not created")
-                
-        except Exception as e:
-            print(f"Generation error for {request.sentence_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
     
     async def _process_streaming_queue(self):
         if self.queue_status.is_streaming:
@@ -216,7 +194,6 @@ class TTSStreamer:
         
         try:
             pending_requests = []
-            next_expected_order = 0
             
             while True:
                 if not self.queue_status.streaming_queue.empty():
@@ -232,9 +209,8 @@ class TTSStreamer:
                 
                 pending_requests.sort(key=lambda r: r.order_index)
                 
-                if pending_requests and pending_requests[0].order_index == next_expected_order:
+                if pending_requests:
                     request = pending_requests.pop(0)
-                    next_expected_order += 1
                     
                     try:
                         if not session_initialized:
