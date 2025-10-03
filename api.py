@@ -9,7 +9,7 @@ from typing import Optional, List
 from dataclasses import dataclass, field
 from indextts.infer_vllm_v2 import IndexTTS2
 import wave
-from uuid4 import uuid4
+from uuid import uuid4
 
 
 class TTSConfig:
