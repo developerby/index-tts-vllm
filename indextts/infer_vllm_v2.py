@@ -248,7 +248,7 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_sentence=60, diffusion_steps=25, **generation_kwargs):
+              verbose=False, max_text_tokens_per_sentence=120, diffusion_steps=25, **generation_kwargs):
         print(">> start inference...")
         start_time = time.perf_counter()
 
