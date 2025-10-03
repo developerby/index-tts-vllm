@@ -1,302 +1,590 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import asyncio
+import json
 import os
-import re
+import base64
 import time
-from subprocess import CalledProcessError
-import traceback
-from typing import List
-
-import numpy as np
-import sentencepiece as spm
-import torch
-import torchaudio
-from torch.nn.utils.rnn import pad_sequence
-from omegaconf import OmegaConf
-from tqdm import tqdm
-
-import warnings
-
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
-from indextts.BigVGAN.models import BigVGAN as Generator
-from indextts.gpt.model import UnifiedVoice
-from indextts.utils.checkpoint import load_checkpoint
-from indextts.utils.feature_extractors import MelSpectrogramFeatures
-
-from indextts.utils.front import TextNormalizer, TextTokenizer
+from typing import Optional, List
+from dataclasses import dataclass, field
+from indextts.infer_vllm_v2 import IndexTTS2
+import wave
+from uuid import uuid4
 
 
-class IndexTTS:
-    def __init__(
-        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None,
+class TTSConfig:
+    DEFAULT_EMO_VECTOR: List[float] = [0, 0, 0, 0, 0, 0, 0.45, 0]
+    DEFAULT_EMO_ALPHA: float = 0.8
+    DEFAULT_DIFFUSION_STEPS: int = 25
+    VOICE_PATH: str = 'examples/a_1.mp3'
+    CHUNK_DURATION: float = 0.3
+    SLEEP_DURATION: float = 0.28
+    GPU_MEMORY_UTILIZATION: float = 0.25
+    BATCH_SIZE: int = 4
+
+
+@dataclass
+class TTSRequest:
+    request_id: str
+    sentence_id: str
+    text: str
+    emo_vector: Optional[List[float]]
+    emo_alpha: Optional[float]
+    diffusion_steps: Optional[int]
+    websocket: WebSocket
+    output_path: Optional[str] = None
+    order_index: int = 0
+    is_last_in_session: bool = False
+
+
+@dataclass
+class QueueStatus:
+    generation_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    streaming_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    order_counter: int = 0
+    is_processing: bool = False
+    is_streaming: bool = False
+
+
+class TTSStreamer:
+    def __init__(self):
+        self.tts = None
+        self.queue_status = QueueStatus()
+    
+    def _init_tts(self):
+        if self.tts is not None:
+            return
+            
+        try:
+            model_dir = os.path.abspath("checkpoints/IndexTTS-2-vLLM")
+            if not os.path.exists(os.path.join(model_dir, "config.yaml")):
+                raise FileNotFoundError(f"config.yaml not found in {model_dir}")
+            
+            self.tts = IndexTTS2(
+                model_dir=model_dir,
+                is_fp16=True,
+                use_cuda_kernel=False,
+                gpu_memory_utilization=TTSConfig.GPU_MEMORY_UTILIZATION
+            )
+        except Exception as e:
+            print(f"TTS import error: {e}")
+            raise
+    
+    async def enqueue_request(
+        self, 
+        text: str, 
+        websocket: WebSocket,
+        emo_vector: Optional[List[float]] = None,
+        emo_alpha: Optional[float] = None,
+        diffusion_steps: Optional[int] = None,
+        request_id: Optional[str] = None,
+        sentence_id: Optional[str] = None,
+        is_last_in_session: bool = False
     ):
-        """
-        Args:
-            cfg_path (str): path to the config file.
-            model_dir (str): path to the model directory.
-            is_fp16 (bool): whether to use fp16.
-            device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
-            use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
-        """
-        if device is not None:
-            self.device = device
-            self.is_fp16 = False if device == "cpu" else is_fp16
-            self.use_cuda_kernel = use_cuda_kernel is not None and use_cuda_kernel and device.startswith("cuda")
-        elif torch.cuda.is_available():
-            self.device = "cuda:0"
-            self.is_fp16 = is_fp16
-            self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
-        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
-            self.device = "mps"
-            self.is_fp16 = False # Use float16 on MPS is overhead than float32
-            self.use_cuda_kernel = False
-        else:
-            self.device = "cpu"
-            self.is_fp16 = False
-            self.use_cuda_kernel = False
-            print(">> Be patient, it may take a while to run in CPU mode.")
-
-        self.cfg = OmegaConf.load(cfg_path)
-        self.model_dir = model_dir
-        self.dtype = torch.float16 if self.is_fp16 else None
-        self.stop_mel_token = self.cfg.gpt.stop_mel_token
-
-        self.gpt = UnifiedVoice(**self.cfg.gpt)
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
-        load_checkpoint(self.gpt, self.gpt_path)
-        self.gpt = self.gpt.to(self.device)
-        if self.is_fp16:
-            self.gpt.eval().half()
-        else:
-            self.gpt.eval()
-        print(">> GPT weights restored from:", self.gpt_path)
-
-        if self.use_cuda_kernel:
-            # preload the CUDA kernel for BigVGAN
-            try:
-                from indextts.BigVGAN.alias_free_activation.cuda import load
-
-                anti_alias_activation_cuda = load.load()
-                print(">> Preload custom CUDA kernel for BigVGAN", anti_alias_activation_cuda)
-            except Exception as ex:
-                traceback.print_exc()
-                print(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
-                self.use_cuda_kernel = False
-        self.bigvgan = Generator(self.cfg.bigvgan, use_cuda_kernel=self.use_cuda_kernel)
-        self.bigvgan_path = os.path.join(self.model_dir, self.cfg.bigvgan_checkpoint)
-        vocoder_dict = torch.load(self.bigvgan_path, map_location="cpu")
-        self.bigvgan.load_state_dict(vocoder_dict["generator"])
-        self.bigvgan = self.bigvgan.to(self.device)
-        # remove weight norm on eval mode
-        self.bigvgan.remove_weight_norm()
-        self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", self.bigvgan_path)
-        self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
-        self.normalizer = TextNormalizer()
-        self.normalizer.load()
-        print(">> TextNormalizer loaded")
-        self.tokenizer = TextTokenizer(self.bpe_path, self.normalizer)
-        print(">> bpe model loaded from:", self.bpe_path)
-        # 缓存参考音频mel：
-        self.cache_audio_prompt = None
-        self.cache_cond_mel = None
-        # 进度引用显示（可选）
-        self.gr_progress = None
-
-    def remove_long_silence(self, codes: torch.Tensor, latent: torch.Tensor, silent_token=52, max_consecutive=30):
-        code_lens = []
-        codes_list = []
-        device = codes.device
-        dtype = codes.dtype
-        isfix = False
-        for i in range(0, codes.shape[0]):
-            code = codes[i]
-            if self.cfg.gpt.stop_mel_token not in code:
-                code_lens.append(len(code))
-                len_ = len(code)
-            else:
-                # len_ = code.cpu().tolist().index(8193)+1
-                len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
-                len_ = len_ - 2
-
-            count = torch.sum(code == silent_token).item()
-            if count > max_consecutive:
-                code = code.cpu().tolist()
-                ncode = []
-                n = 0
-                for k in range(0, len_):
-                    if code[k] != silent_token:
-                        ncode.append(code[k])
-                        n = 0
-                    elif code[k] == silent_token and n < 10:
-                        ncode.append(code[k])
-                        n += 1
-                    # if (k == 0 and code[k] == 52) or (code[k] == 52 and code[k-1] == 52):
-                    #    n += 1
-                len_ = len(ncode)
-                ncode = torch.LongTensor(ncode)
-                codes_list.append(ncode.to(device, dtype=dtype))
-                isfix = True
-                # codes[i] = self.stop_mel_token
-                # codes[i, 0:len_] = ncode
-            else:
-                codes_list.append(codes[i])
-            code_lens.append(len_)
-
-        codes = pad_sequence(codes_list, batch_first=True) if isfix else codes[:, :-2]
-        code_lens = torch.LongTensor(code_lens).to(device, dtype=dtype)
-        return codes, code_lens
-
-    def _set_gr_progress(self, value, desc):
-        if self.gr_progress is not None:
-            self.gr_progress(value, desc=desc)
-
-    # 原始推理模式
-    def infer(self, audio_prompt, text, output_path, verbose=False):
-        print(">> start inference...")
-        self._set_gr_progress(0, "start inference...")
-        if verbose:
-            print(f"origin text:{text}")
-        start_time = time.perf_counter()
-
-        # 如果参考音频改变了，才需要重新生成 cond_mel, 提升速度
-        if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
-            audio, sr = torchaudio.load(audio_prompt)
-            audio = torch.mean(audio, dim=0, keepdim=True)
-            if audio.shape[0] > 1:
-                audio = audio[0].unsqueeze(0)
-            audio = torchaudio.transforms.Resample(sr, 24000)(audio)
-            cond_mel = MelSpectrogramFeatures()(audio).to(self.device)
-            cond_mel_frame = cond_mel.shape[-1]
-            if verbose:
-                print(f"cond_mel shape: {cond_mel.shape}", "dtype:", cond_mel.dtype)
-
-            self.cache_audio_prompt = audio_prompt
-            self.cache_cond_mel = cond_mel
-        else:
-            cond_mel = self.cache_cond_mel
-            cond_mel_frame = cond_mel.shape[-1]
-            pass
-
-        auto_conditioning = cond_mel
-        text_tokens_list = self.tokenizer.tokenize(text)
-        sentences = self.tokenizer.split_sentences(text_tokens_list)
-        if verbose:
-            print("text token count:", len(text_tokens_list))
-            print("sentences count:", len(sentences))
-            print(*sentences, sep="\n")
-        top_p = 0.8
-        top_k = 30
-        temperature = 1.0
-        autoregressive_batch_size = 1
-        length_penalty = 0.0
-        num_beams = 1
-        repetition_penalty = 10.0
-        max_mel_tokens = 600
-        sampling_rate = 24000
-        # lang = "EN"
-        # lang = "ZH"
-        wavs = []
-        gpt_gen_time = 0
-        bigvgan_time = 0
-
-        speech_conditioning_latent = self.gpt.get_conditioning(
-            auto_conditioning.half(),
-            torch.tensor([auto_conditioning.shape[-1]], device=self.device)
+        if self.tts is None:
+            self._init_tts()
+        
+        if not request_id:
+            request_id = str(uuid4())
+        
+        if not sentence_id:
+            sentence_id = str(uuid4())
+        
+        order_index = self.queue_status.order_counter
+        self.queue_status.order_counter += 1
+        
+        request = TTSRequest(
+            request_id=request_id,
+            sentence_id=sentence_id,
+            text=text,
+            emo_vector=emo_vector,
+            emo_alpha=emo_alpha,
+            diffusion_steps=diffusion_steps,
+            websocket=websocket,
+            order_index=order_index,
+            is_last_in_session=is_last_in_session
         )
-
-        for sent in sentences:
-            text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
-            text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
-            # text_tokens = F.pad(text_tokens, (0, 1))  # This may not be necessary.
-            # text_tokens = F.pad(text_tokens, (1, 0), value=0)
-            # text_tokens = F.pad(text_tokens, (0, 1), value=1)
-            if verbose:
-                print(text_tokens)
-                print(f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}")
-                # debug tokenizer
-                text_token_syms = self.tokenizer.convert_ids_to_tokens(text_tokens[0].tolist())
-                print("text_token_syms is same as sentence tokens", text_token_syms == sent)
-
-            # text_len = torch.IntTensor([text_tokens.size(1)], device=text_tokens.device)
-            # print(text_len)
-
-            m_start_time = time.perf_counter()
-            with torch.no_grad():
-                with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
-                    codes, latent = self.gpt.inference_speech(speech_conditioning_latent, text_tokens,
-                                                        cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]],
-                                                                                      device=text_tokens.device),
-                                                        # text_lengths=text_len,
-                                                        do_sample=True,
-                                                        top_p=top_p,
-                                                        top_k=top_k,
-                                                        temperature=temperature,
-                                                        num_return_sequences=autoregressive_batch_size,
-                                                        length_penalty=length_penalty,
-                                                        num_beams=num_beams,
-                                                        repetition_penalty=repetition_penalty,
-                                                        max_generate_length=max_mel_tokens)
-                gpt_gen_time += time.perf_counter() - m_start_time
+        
+        await self.queue_status.generation_queue.put(request)
+        await websocket.send_json({
+            "type": "request.queued",
+            "request_id": request_id,
+            "sentence_id": sentence_id,
+            "queue_position": order_index,
+            "queue_size": self.queue_status.generation_queue.qsize()
+        })
+        
+        if not self.queue_status.is_processing:
+            asyncio.create_task(self._process_generation_queue())
+        
+        if not self.queue_status.is_streaming:
+            asyncio.create_task(self._process_streaming_queue())
+    
+    async def _process_generation_queue(self):
+        if self.queue_status.is_processing:
+            return
+        
+        self.queue_status.is_processing = True
+        
+        try:
+            while not self.queue_status.generation_queue.empty():
+                batch = []
+                batch_size = min(
+                    TTSConfig.BATCH_SIZE, 
+                    self.queue_status.generation_queue.qsize()
+                )
                 
-                # code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
-                # if verbose:
-                #     print(codes, type(codes))
-                #     print(f"codes shape: {codes.shape}, codes type: {codes.dtype}")
-                #     print(f"code len: {code_lens}")
+                for _ in range(batch_size):
+                    if not self.queue_status.generation_queue.empty():
+                        request = await self.queue_status.generation_queue.get()
+                        batch.append(request)
+                
+                if not batch:
+                    break
+                
+                print(f"Processing batch of {len(batch)} requests")
+                
+                tasks = [self._generate_audio(req) for req in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for req, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        print(f"Generation error for {req.sentence_id}: {result}")
+                        try:
+                            await req.websocket.send_json({
+                                "type": "error",
+                                "request_id": req.request_id,
+                                "sentence_id": req.sentence_id,
+                                "error": str(result)
+                            })
+                        except:
+                            pass
+                    
+                    self.queue_status.generation_queue.task_done()
+                
+        finally:
+            self.queue_status.is_processing = False
+    
+    async def _generate_audio(self, request: TTSRequest):
+        try:
+            await request.websocket.send_json({
+                "type": "generation.started",
+                "request_id": request.request_id,
+                "sentence_id": request.sentence_id
+            })
+            
+            output_path = f"/tmp/tts_output_{request.sentence_id.replace('_', '-').replace('.', '-')}.wav"
+            
+            print(f"Generating audio to: {output_path}")
+            
+            await self.tts.infer(
+                spk_audio_prompt=TTSConfig.VOICE_PATH,
+                text=request.text,
+                output_path=output_path,
+                emo_vector=request.emo_vector if request.emo_vector is not None else TTSConfig.DEFAULT_EMO_VECTOR,
+                emo_alpha=request.emo_alpha if request.emo_alpha is not None else TTSConfig.DEFAULT_EMO_ALPHA,
+                diffusion_steps=request.diffusion_steps if request.diffusion_steps is not None else TTSConfig.DEFAULT_DIFFUSION_STEPS,
+                verbose=True
+            )
+            
+            print(f"File exists after generation: {os.path.exists(output_path)}")
+            
+            if os.path.exists(output_path):
+                request.output_path = output_path
+                await self.queue_status.streaming_queue.put(request)
+                
+                await request.websocket.send_json({
+                    "type": "generation.completed",
+                    "request_id": request.request_id,
+                    "sentence_id": request.sentence_id
+                })
+            else:
+                raise Exception("Generation failed: output file not created")
+                
+        except Exception as e:
+            print(f"Generation error for {request.sentence_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    async def _process_streaming_queue(self):
+        if self.queue_status.is_streaming:
+            return
+        
+        self.queue_status.is_streaming = True
+        session_initialized = False
+        
+        try:
+            pending_requests = []
+            next_expected_order = 0
+            
+            while True:
+                if not self.queue_status.streaming_queue.empty():
+                    request = await self.queue_status.streaming_queue.get()
+                    pending_requests.append(request)
+                    self.queue_status.streaming_queue.task_done()
+                
+                elif not pending_requests:
+                    if self.queue_status.generation_queue.empty() and not self.queue_status.is_processing:
+                        break
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                pending_requests.sort(key=lambda r: r.order_index)
+                
+                if pending_requests and pending_requests[0].order_index == next_expected_order:
+                    request = pending_requests.pop(0)
+                    next_expected_order += 1
+                    
+                    try:
+                        if not session_initialized:
+                            with wave.open(request.output_path, 'rb') as wav_file:
+                                sample_rate = wav_file.getframerate()
+                            
+                            await request.websocket.send_json({
+                                "type": "session.created",
+                                "session": {
+                                    "output_audio_format": "pcm16",
+                                    "sample_rate": sample_rate
+                                }
+                            })
+                            session_initialized = True
+                        
+                        print(f"Streaming from: {request.output_path}, exists: {os.path.exists(request.output_path)}")
+                        
+                        await self._stream_audio_file(
+                            request.output_path,
+                            request.websocket,
+                            request.request_id,
+                            request.sentence_id,
+                            request.is_last_in_session
+                        )
+                        
+                        if os.path.exists(request.output_path):
+                            os.unlink(request.output_path)
+                            print(f"Deleted: {request.output_path}")
+                            
+                    except Exception as e:
+                        print(f"Streaming error for {request.sentence_id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        await request.websocket.send_json({
+                            "type": "error",
+                            "request_id": request.request_id,
+                            "sentence_id": request.sentence_id,
+                            "error": f"Streaming failed: {str(e)}"
+                        })
+                else:
+                    await asyncio.sleep(0.1)
+                
+        finally:
+            self.queue_status.is_streaming = False
+    
+    async def _stream_audio_file(self, file_path: str, websocket: WebSocket, request_id: str, sentence_id: str, is_last: bool):
+        try:
+            with wave.open(file_path, 'rb') as wav_file:
+                sample_rate = wav_file.getframerate()
+                
+                chunk_size = int(sample_rate * TTSConfig.CHUNK_DURATION)
+                
+                while frames := wav_file.readframes(chunk_size):
+                    await websocket.send_json({
+                        "type": "response.audio.delta",
+                        "request_id": request_id,
+                        "sentence_id": sentence_id,
+                        "delta": base64.b64encode(frames).decode('utf-8')
+                    })
+                    
+                    await asyncio.sleep(TTSConfig.SLEEP_DURATION)
+                
+                if is_last:
+                    await websocket.send_json({
+                        "type": "response.audio.done",
+                        "request_id": request_id
+                    })
+                
+        except Exception as e:
+            await websocket.send_json({
+                "type": "error",
+                "request_id": request_id,
+                "sentence_id": sentence_id,
+                "error": str(e)
+            })
 
-                # # remove ultra-long silence if exits
-                # # temporarily fix the long silence bug.
-                # codes, code_lens = self.remove_long_silence(codes, latent, silent_token=52, max_consecutive=30)
-                # if verbose:
-                #     print(codes, type(codes))
-                #     print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
-                #     print(f"code len: {code_lens}")
 
-                m_start_time = time.perf_counter()
-                wav, _ = self.bigvgan(latent, auto_conditioning.transpose(1, 2))
-                bigvgan_time += time.perf_counter() - m_start_time
-                wav = wav.squeeze(1)
+app = FastAPI(title="TTS vLLM Streaming API")
+tts_streamer = None
 
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                wavs.append(wav.cpu())  # to cpu before saving
-        end_time = time.perf_counter()
 
-        wav = torch.cat(wavs, dim=1)
-        wav_length = wav.shape[-1] / sampling_rate
-        print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+@app.on_event("startup")
+async def startup_event():
+    global tts_streamer
+    tts_streamer = TTSStreamer()
+    print("Initializing TTS model...")
+    tts_streamer._init_tts()
+    print("TTS model initialized successfully")
 
-        # save audio
-        wav = wav.cpu()  # to cpu
-        if output_path:
-            # 直接保存音频到指定路径中
-            if os.path.isfile(output_path):
-                os.remove(output_path)
-                print(">> remove old wav file:", output_path)
-            if os.path.dirname(output_path) != "":
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
-            print(">> wav file saved to:", output_path)
-            return output_path
-        else:
-            # 返回以符合Gradio的格式要求
-            wav_data = wav.type(torch.int16)
-            wav_data = wav_data.numpy().T
-            return (sampling_rate, wav_data)
+
+@app.websocket("/tts")
+async def websocket_tts_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            request = json.loads(data)
+            
+            text = request.get("text")
+            if not text:
+                await websocket.send_json({"error": "Text parameter is required"})
+                continue
+            
+            emo_vector = request.get("emo_vector")
+            emo_alpha = request.get("emo_alpha")
+            diffusion_steps = request.get("diffusion_steps")
+            request_id = request.get("request_id")
+            sentence_id = request.get("sentence_id")
+            is_last_in_session = request.get("is_last_in_session", False)
+            
+            await tts_streamer.enqueue_request(
+                text, websocket, emo_vector, emo_alpha, diffusion_steps, 
+                request_id, sentence_id, is_last_in_session
+            )
+            
+    except WebSocketDisconnect:
+        print("Client disconnected")
+    except Exception as e:
+        await websocket.send_json({"error": f"Connection error: {str(e)}"})
+
+
+@app.get("/")
+async def get_test_page():
+    html_content = """<!DOCTYPE html>
+<html>
+<head>
+    <title>TTS vLLM Streaming Test</title>
+</head>
+<body>
+    <h1>TTS vLLM Streaming Test</h1>
+    <div style="margin: 20px;">
+        <label>Text:</label><br>
+        <input type="text" id="textInput" placeholder="Enter text" style="width: 400px;"><br><br>
+        
+        <label>Emotion Vector (8 values):</label><br>
+        <input type="text" id="emoVector" placeholder="e.g., 0,0,0,0,0,0,0.45,0" style="width: 400px;"><br><br>
+        
+        <label>Emotion Alpha (0.0-1.0):</label><br>
+        <input type="number" id="emoAlpha" step="0.01" min="0" max="1.0" value="0.8" style="width: 400px;"><br><br>
+        
+        <label>Diffusion Steps (1-100):</label><br>
+        <input type="number" id="diffusionSteps" step="1" min="1" max="100" value="25" style="width: 400px;"><br><br>
+        
+        <button onclick="sendText()">Generate & Stream</button>
+        <button onclick="stopAudio()">Stop</button>
+    </div>
+    <br>
+    <div id="status">Ready</div>
+    <div id="queue">Queue: 0</div>
+    
+    <script>
+        let ws = null;
+        let audioContext = null;
+        let sampleRate = 24000;
+        let nextTime = 0;
+        let audioQueue = [];
+        let isPlaying = false;
+        
+        function initWebSocket() {
+            ws = new WebSocket(`ws://${window.location.host}/tts`);
+            
+            ws.onopen = () => {
+                document.getElementById('status').textContent = 'Connected';
+            };
+            
+            ws.onmessage = async (event) => {
+                const message = JSON.parse(event.data);
+                
+                if (message.type === 'request.queued') {
+                    document.getElementById('status').textContent = `Queued (position: ${message.queue_position})`;
+                    document.getElementById('queue').textContent = `Queue: ${message.queue_size}`;
+                }
+                else if (message.type === 'generation.started') {
+                    document.getElementById('status').textContent = 'Generating audio...';
+                }
+                else if (message.type === 'generation.completed') {
+                    document.getElementById('status').textContent = 'Waiting to stream...';
+                }
+                else if (message.type === 'session.created') {
+                    stopAudio();
+                    await initAudio(message.session.sample_rate);
+                    document.getElementById('status').textContent = 'Streaming...';
+                }
+                else if (message.type === 'response.audio.delta') {
+                    playAudioDelta(message.delta);
+                }
+                else if (message.type === 'response.audio.done') {
+                    if (audioQueue.length > 0) {
+                        playQueue();
+                    }
+                    document.getElementById('status').textContent = 'Complete';
+                }
+                else if (message.error) {
+                    document.getElementById('status').textContent = 'Error: ' + message.error;
+                }
+            };
+            
+            ws.onerror = () => {
+                document.getElementById('status').textContent = 'Connection error';
+            };
+        }
+        
+        async function initAudio(rate) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            sampleRate = rate;
+            
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+            
+            nextTime = audioContext.currentTime + 0.3;
+            audioQueue = [];
+            isPlaying = false;
+        }
+        
+        async function playAudioDelta(base64Audio) {
+            if (!audioContext || !base64Audio) return;
+            
+            try {
+                const binaryString = atob(base64Audio);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                
+                const pcm16 = new Int16Array(bytes.buffer);
+                const float32 = new Float32Array(pcm16.length);
+                for (let i = 0; i < pcm16.length; i++) {
+                    float32[i] = pcm16[i] / 32768.0;
+                }
+                
+                const audioBuffer = audioContext.createBuffer(1, float32.length, sampleRate);
+                audioBuffer.getChannelData(0).set(float32);
+                
+                audioQueue.push(audioBuffer);
+                
+                if (!isPlaying && audioQueue.length >= 3) {
+                    isPlaying = true;
+                    playQueue();
+                }
+                
+            } catch (e) {
+                console.error('Audio error:', e);
+            }
+        }
+        
+        function playQueue() {
+            if (!audioContext || audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            
+            const currentTime = audioContext.currentTime;
+            
+            if (nextTime < currentTime) {
+                nextTime = currentTime;
+            }
+            
+            while (audioQueue.length > 0) {
+                const audioBuffer = audioQueue.shift();
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                
+                source.start(nextTime);
+                nextTime += audioBuffer.duration;
+            }
+            
+            isPlaying = false;
+        }
+        
+        function sendText() {
+            const text = document.getElementById('textInput').value;
+            if (!text) return;
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                initWebSocket();
+                setTimeout(() => sendText(), 1000);
+                return;
+            }
+            
+            const requestId = Date.now().toString();
+            
+            const sentences = text
+                .split('.')
+                .map(s => s.trim())
+                .filter(s => s.length > 0);
+            
+            if (sentences.length === 0) return;
+            
+            const emoVectorStr = document.getElementById('emoVector').value.trim();
+            const emoVector = emoVectorStr 
+                ? emoVectorStr.split(',').map(v => parseFloat(v.trim()))
+                : null;
+            
+            const emoAlphaStr = document.getElementById('emoAlpha').value.trim();
+            const emoAlpha = emoAlphaStr 
+                ? parseFloat(emoAlphaStr)
+                : null;
+            
+            const diffusionStepsStr = document.getElementById('diffusionSteps').value.trim();
+            const diffusionSteps = diffusionStepsStr 
+                ? parseInt(diffusionStepsStr)
+                : null;
+            
+            sentences.forEach((sentence, index) => {
+                const payload = {
+                    text: sentence,
+                    request_id: requestId,
+                    sentence_id: `${requestId}_${index}`,
+                    is_last_in_session: index === sentences.length - 1
+                };
+                
+                if (emoVector) payload.emo_vector = emoVector;
+                if (emoAlpha !== null && emoAlpha >= 0 && emoAlpha <= 1.0) {
+                    payload.emo_alpha = emoAlpha;
+                }
+                if (diffusionSteps !== null && diffusionSteps >= 1 && diffusionSteps <= 100) {
+                    payload.diffusion_steps = diffusionSteps;
+                }
+                
+                ws.send(JSON.stringify(payload));
+            });
+            
+            document.getElementById('status').textContent = `Sending ${sentences.length} sentences...`;
+        }
+        
+        function stopAudio() {
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            nextTime = 0;
+            audioQueue = [];
+            isPlaying = false;
+            document.getElementById('status').textContent = 'Stopped';
+        }
+        
+        initWebSocket();
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html_content)
 
 
 if __name__ == "__main__":
-    prompt_wav="test_data/input.wav"
-    #text="晕 XUAN4 是 一 种 GAN3 觉"
-    #text='大家好，我现在正在bilibili 体验 ai 科技，说实话，来之前我绝对想不到！AI技术已经发展到这样匪夷所思的地步了！'
-    text="There is a vehicle arriving in dock number 7?"
-
-    tts = IndexTTS(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, use_cuda_kernel=False)
-    tts.infer(audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
+    import uvicorn
+    import sys
+    
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
+    print(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
