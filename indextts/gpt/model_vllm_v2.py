@@ -40,7 +40,7 @@ class LearnedPositionEmbeddings(nn.Module):
 
 class UnifiedVoice(nn.Module):
     def __init__(self, vllm_model,
-                 layers=8, model_dim=512, heads=8, max_text_tokens=120, max_mel_tokens=1024, max_conditioning_inputs=1,
+                 layers=8, model_dim=512, heads=8, max_text_tokens=120, max_mel_tokens=250, max_conditioning_inputs=1,
                  mel_length_compression=1024, number_text_tokens=256,
                  start_text_token=0, stop_text_token=1, number_mel_codes=8194, start_mel_token=8192, stop_mel_token=8193,
                  train_solo_embeddings=False, use_mel_codes_as_input=True,

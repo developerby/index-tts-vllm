@@ -18,7 +18,7 @@ class TTSConfig:
     DEFAULT_DIFFUSION_STEPS: int = 25
     VOICE_PATH: str = 'examples/a_1.mp3'
     CHUNK_DURATION: float = 0.3
-    SLEEP_DURATION: float = 0.28
+    SLEEP_DURATION: float = 0.1
     GPU_MEMORY_UTILIZATION: float = 0.25
 
 
