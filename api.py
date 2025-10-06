@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import base64
-import time
+import gc
 from typing import Optional, List
 from dataclasses import dataclass, field
 from indextts.infer_vllm_v2 import IndexTTS2
@@ -66,6 +66,14 @@ class TTSRequest:
     output_path: Optional[str] = None
     order_index: int = 0
     is_last_in_session: bool = False
+    
+    def cleanup(self):
+        if self.output_path and os.path.exists(self.output_path):
+            try:
+                os.unlink(self.output_path)
+                print(f"Deleted: {self.output_path}")
+            except Exception as e:
+                print(f"Cleanup error: {e}")
 
 
 @dataclass
@@ -213,11 +221,13 @@ class TTSStreamer:
                         "sentence_id": request.sentence_id,
                         "error": str(e)
                     })
-                
-                self.queue_status.generation_queue.task_done()
+                    request.cleanup()
+                finally:
+                    self.queue_status.generation_queue.task_done()
                 
         finally:
             self.queue_status.is_processing = False
+            gc.collect()
     
     async def _process_streaming_queue(self):
         if self.queue_status.is_streaming:
@@ -269,10 +279,6 @@ class TTSStreamer:
                             request.sentence_id,
                             request.is_last_in_session
                         )
-                        
-                        if os.path.exists(request.output_path):
-                            os.unlink(request.output_path)
-                            print(f"Deleted: {request.output_path}")
                             
                     except Exception as e:
                         print(f"Streaming error for {request.sentence_id}: {e}")
@@ -284,9 +290,12 @@ class TTSStreamer:
                             "sentence_id": request.sentence_id,
                             "error": f"Streaming failed: {str(e)}"
                         })
+                    finally:
+                        request.cleanup()
                 
         finally:
             self.queue_status.is_streaming = False
+            gc.collect()
     
     async def _stream_audio_file(self, file_path: str, websocket: WebSocket, request_id: str, sentence_id: str, is_last: bool):
         try:
