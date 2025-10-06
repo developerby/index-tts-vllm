@@ -14,7 +14,7 @@ class TTSConfig:
     DEFAULT_EMO_VECTOR: List[float] = [0, 0, 0, 0, 0, 0, 0.45, 0]
     DEFAULT_EMO_ALPHA: float = 0.8
     DEFAULT_DIFFUSION_STEPS: int = 25
-    VOICE_PATH: str = 'examples/a_1.mp3'
+    VOICE_PATH: str = 'examples/voice_2.mp3'
     CHUNK_DURATION: float = 0.3
     SLEEP_DURATION: float = 0.28
     GPU_MEMORY_UTILIZATION: float = 0.25

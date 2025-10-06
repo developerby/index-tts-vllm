@@ -10,16 +10,47 @@ from dataclasses import dataclass, field
 from indextts.infer_vllm_v2 import IndexTTS2
 import wave
 from uuid import uuid4
+from enum import Enum
+from pathlib import Path
+
+
+class Voice(str, Enum):
+    HONEY = "honey"
+    SUNSHINE = "sunshine"
+    CHAN = "chan"
+    ENDRA = "endra"
+    CHLOE = "chloe"
 
 
 class TTSConfig:
-    DEFAULT_EMO_VECTOR: List[float] = [0, 0, 0, 0, 0, 0, 0.45, 0]
-    DEFAULT_EMO_ALPHA: float = 0.8
+    DEFAULT_EMO_VECTOR: List[float] = [0, 0, 0, 0, 0, 0, 0, 0]
+    DEFAULT_EMO_ALPHA: float = 0.0
     DEFAULT_DIFFUSION_STEPS: int = 25
-    VOICE_PATH: str = 'examples/a_1.mp3'
+    DEFAULT_VOICE: Voice = Voice.HONEY
     CHUNK_DURATION: float = 0.3
     SLEEP_DURATION: float = 0.1
-    GPU_MEMORY_UTILIZATION: float = 0.25
+    GPU_MEMORY_UTILIZATION: float = 0.10
+    
+    VOICE_MAPPING: dict[Voice, str] = {
+        Voice.HONEY: "voice_2.mp3",
+        Voice.SUNSHINE: "voice_british_f_001.wav",
+        Voice.CHAN: "asian_eng_m_001.wav",
+        Voice.ENDRA: "eng_f_bassy_001.wav",
+        Voice.CHLOE: "eng_f_bassy_002.wav",
+    }
+    
+    @classmethod
+    def get_voice_path(cls, voice: Optional[str] = None) -> str:
+        if not voice:
+            voice_enum = cls.DEFAULT_VOICE
+        else:
+            try:
+                voice_enum = Voice(voice.lower())
+            except ValueError:
+                voice_enum = cls.DEFAULT_VOICE
+        
+        filename = cls.VOICE_MAPPING[voice_enum]
+        return str(Path("examples") / filename)
 
 
 @dataclass
@@ -27,6 +58,7 @@ class TTSRequest:
     request_id: str
     sentence_id: str
     text: str
+    voice: Optional[str]
     emo_vector: Optional[List[float]]
     emo_alpha: Optional[float]
     diffusion_steps: Optional[int]
@@ -73,6 +105,7 @@ class TTSStreamer:
         self, 
         text: str, 
         websocket: WebSocket,
+        voice: Optional[str] = None,
         emo_vector: Optional[List[float]] = None,
         emo_alpha: Optional[float] = None,
         diffusion_steps: Optional[int] = None,
@@ -96,6 +129,7 @@ class TTSStreamer:
             request_id=request_id,
             sentence_id=sentence_id,
             text=text,
+            voice=voice,
             emo_vector=emo_vector,
             emo_alpha=emo_alpha,
             diffusion_steps=diffusion_steps,
@@ -141,7 +175,7 @@ class TTSStreamer:
                     print(f"Generating audio to: {output_path}")
                     
                     await self.tts.infer(
-                        spk_audio_prompt=TTSConfig.VOICE_PATH,
+                        spk_audio_prompt=TTSConfig.get_voice_path(request.voice),
                         text=request.text,
                         output_path=output_path,
                         emo_vector=request.emo_vector if request.emo_vector is not None else TTSConfig.DEFAULT_EMO_VECTOR,
@@ -313,6 +347,7 @@ async def websocket_tts_endpoint(websocket: WebSocket):
                 await websocket.send_json({"error": "Text parameter is required"})
                 continue
             
+            voice = request.get("voice")
             emo_vector = request.get("emo_vector")
             emo_alpha = request.get("emo_alpha")
             diffusion_steps = request.get("diffusion_steps")
@@ -321,7 +356,7 @@ async def websocket_tts_endpoint(websocket: WebSocket):
             is_last_in_session = request.get("is_last_in_session", False)
             
             await tts_streamer.enqueue_request(
-                text, websocket, emo_vector, emo_alpha, diffusion_steps, 
+                text, websocket, voice, emo_vector, emo_alpha, diffusion_steps, 
                 request_id, sentence_id, is_last_in_session
             )
             
@@ -343,6 +378,15 @@ async def get_test_page():
     <div style="margin: 20px;">
         <label>Text:</label><br>
         <input type="text" id="textInput" placeholder="Enter text" style="width: 400px;"><br><br>
+        
+        <label>Voice:</label><br>
+        <select id="voiceSelect" style="width: 400px;">
+            <option value="honey">Honey (voice_2)</option>
+            <option value="sunshine">Sunshine (voice_british_f_001)</option>
+            <option value="chan">Chan (asian_eng_m_001)</option>
+            <option value="endra">Endra (eng_f_bassy_001)</option>
+            <option value="chloe">Chloe (eng_f_bassy_001)</option>
+        </select><br><br>
         
         <label>Emotion Vector (8 values):</label><br>
         <input type="text" id="emoVector" placeholder="e.g., 0,0,0,0,0,0,0.45,0" style="width: 400px;"><br><br>
@@ -500,6 +544,8 @@ async def get_test_page():
             
             if (sentences.length === 0) return;
             
+            const voice = document.getElementById('voiceSelect').value;
+            
             const emoVectorStr = document.getElementById('emoVector').value.trim();
             const emoVector = emoVectorStr 
                 ? emoVectorStr.split(',').map(v => parseFloat(v.trim()))
@@ -518,6 +564,7 @@ async def get_test_page():
             sentences.forEach((sentence, index) => {
                 const payload = {
                     text: sentence,
+                    voice: voice,
                     request_id: requestId,
                     sentence_id: `${requestId}_${index}`,
                     is_last_in_session: index === sentences.length - 1
