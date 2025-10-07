@@ -28,7 +28,7 @@ class TTSConfig:
     DEFAULT_DIFFUSION_STEPS: int = 25
     DEFAULT_VOICE: Voice = Voice.HONEY
     CHUNK_DURATION: float = 0.3
-    SLEEP_DURATION: float = 0.1
+    SLEEP_DURATION: float = 0.01
     GPU_MEMORY_UTILIZATION: float = 0.10
     
     VOICE_MAPPING: dict[Voice, str] = {
